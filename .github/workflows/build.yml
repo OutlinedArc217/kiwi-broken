@@ -1,174 +1,140 @@
-name: Kiwi Browser Automated Build
+name: Kiwi Browser Automated Pipeline
 
 on:
   workflow_dispatch:
-    inputs:
-      prepareRelease:
-        description: 'Publish to Google Play Store'
-        required: true
-        default: 'no'
   schedule:
-    - cron: '0 0 * * 1'  # 每周一 UTC 0 点自动触发
-  push:
-    branches: [main]
+    - cron: '0 0 * * 1'  # Every Monday 00:00 UTC
+
+env:
+  BUILD_DIR: out/Release
+  APK_PREFIX: KiwiBrowser
+  ANDROID_TARGETS: "arm64 x64"
 
 jobs:
-  sync_chromium:
-    name: Sync Chromium Code
+  build-and-release:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 360
+
     steps:
-      # ------------------------- 精简代码克隆 -------------------------
-      - name: Checkout Kiwi (Shallow)
+      # ============== SPARSE CHECKOUT ==============
+      - name: Configure sparse checkout
+        run: |
+          git config --global core.sparseCheckout true
+          git config --global core.sparseCheckoutCone false
+          mkdir -p .git/info
+          echo "/*" > .git/info/sparse-checkout
+          echo "!third_party/*" >> .git/info/sparse-checkout
+          echo "!tools/*" >> .git/info/sparse-checkout
+          echo "!docs/*" >> .git/info/sparse-checkout
+
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          repository: OutlinedArc217/kiwi-broken
+          token: ${{ secrets.GH_TOKEN }}
+          path: src
           fetch-depth: 1
           sparse-checkout: |
             /*
-            !third_party
-            !tools
-            !docs
+            !third_party/*
+            !tools/*
+            !docs/*
 
-      # ------------------------- 智能合并策略 -------------------------
-      - name: Merge Chromium Updates
-        run: |
-          git config --global user.name "Kiwi Bot"
-          git config --global user.email "bot@kiwibrowser.com"
-          
-          # 添加 Chromium 远程仓库
-          if ! git remote | grep -q chromium; then
-            git remote add chromium https://chromium.googlesource.com/chromium/src
-          fi
-          
-          # 浅层拉取最新代码
-          git fetch --depth=1 chromium main
-          
-          # 自动合并策略（优先保留Kiwi修改）
-          git merge FETCH_HEAD -X ours --no-commit || true
-          
-          # 提交合并结果
-          git commit -m "Auto-merge Chromium $(date +%Y%m%d)" --allow-empty
-          git push origin HEAD:chromium-merge
-
-  build:
-    name: Build APKs
-    needs: sync_chromium
-    runs-on: ubuntu-22.04
-    timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [arm64]  # 仅构建arm64减少空间占用
-
-    steps:
-      # ------------------------- 空间优化配置 -------------------------
-      - name: Setup SSD Storage
-        run: |
-          sudo mkdir -p /mnt/ssd
-          sudo mount -t tmpfs -o size=20G tmpfs /mnt/ssd
-          ln -s /mnt/ssd $GITHUB_WORKSPACE/ssd
-
-      # ------------------------- 代码检出 -------------------------
-      - name: Checkout Merged Code
-        uses: actions/checkout@v4
-        with:
-          ref: chromium-merge
-          path: ${{ github.workspace }}/ssd/src
-
-      # ------------------------- 依赖缓存 -------------------------
-      - name: Restore Build Cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.ccache
-            ssd/src/third_party
-          key: ${{ runner.os }}-chromium-${{ hashFiles('ssd/src/DEPS') }}
-
-      # ------------------------- 签名配置 -------------------------
-      - name: Inject Signing Key
-        env:
-          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
-        run: |
-          echo "$SIGNING_KEY" | base64 -d > ssd/keystore.jks
-          ls -lh ssd/keystore.jks
-
-      # ------------------------- 精简构建环境 -------------------------
-      - name: Setup Minimal Environment
+      # ============== ENVIRONMENT SETUP ==============
+      - name: Set up build environment
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            python3-minimal \
-            openjdk-11-jdk-headless \
-            libncurses5 \
-            ninja-build
+            python3 python3-pip ninja-build \
+            libncurses5 libglib2.0-0 libnss3 \
+            openjdk-11-jdk-headless
+          sudo update-java-alternatives --set java-1.11.0-openjdk-amd64
 
-      # ------------------------- 构建参数配置 -------------------------
-      - name: Configure GN Args
-        working-directory: ssd/src
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo "$GITHUB_WORKSPACE/depot_tools" >> $GITHUB_PATH
+
+      # ============== CODE MERGING ==============
+      - name: Merge Chromium updates
+        working-directory: ./src
         run: |
-          mkdir -p out/android_${{ matrix.platform }}
-          cat <<EOF > out/android_${{ matrix.platform }}/args.gn
-          target_os = "android"
-          target_cpu = "${{ matrix.platform }}"
-          is_debug = false
-          is_official_build = true
-          symbol_level = 1
-          android_keystore_name = "${{ secrets.ALIAS }}"
-          android_keystore_password = "${{ secrets.KEY_STORE_PASSWORD }}"
-          android_keystore_path = "../../../../keystore.jks"
-          enable_resource_whitelist_generation = false
-          EOF
+          git config user.name "Kiwi AutoMerger"
+          git config user.email "automerger@kiwibrowser.com"
+          
+          if ! git remote | grep -q chromium; then
+            git remote add chromium https://chromium.googlesource.com/chromium/src
+          fi
 
-      # ------------------------- 分阶段构建 -------------------------
-      - name: Build Core Components
-        working-directory: ssd/src
+          git fetch chromium --tags --depth=1
+          LATEST_TAG=$(git describe --tags $(git rev-list --tags --max-count=1))
+          
+          git merge $LATEST_TAG -X ours --no-commit || true
+          git commit -m "Merge Chromium $LATEST_TAG" || echo "No changes to commit"
+
+      # ============== BUILD CONFIGURATION ==============
+      - name: Generate build configs
+        working-directory: ./src
         run: |
-          gn gen out/android_${{ matrix.platform }}
-          autoninja -C out/android_${{ matrix.platform }} base
+          for arch in $ANDROID_TARGETS; do
+            mkdir -p out/$arch
+            cat << EOF > out/$arch/args.gn
+            target_os = "android"
+            target_cpu = "$arch"
+            is_debug = false
+            is_official_build = true
+            symbol_level = 1
+            android_default_version_code = "$(date +%Y%m%d)"
+            android_keystore_name = "release"
+            android_keystore_password = "${{ secrets.KEY_STORE_PASSWORD }}"
+            android_keystore_path = "../../../keystore.jks"
+            EOF
+          done
 
-      - name: Build Browser Module
-        working-directory: ssd/src
+      # ============== PARALLEL BUILD ==============
+      strategy:
+        matrix:
+          arch: [arm64, x64]
+        fail-fast: false
+
+      - name: Build APK (${{ matrix.arch }})
+        working-directory: ./src
         run: |
-          autoninja -C out/android_${{ matrix.platform }} chrome_public_apk
+          gn gen out/${{ matrix.arch }} --args="$(cat out/${{ matrix.arch }}/args.gn)"
+          autoninja -C out/${{ matrix.arch }} chrome_public_apk -j $(nproc)
 
-      # ------------------------- 签名 & 发布 -------------------------
-      - name: Sign APK
+      # ============== ARTIFACT PROCESSING ==============
+      - name: Sign APKs
         uses: r0adkll/sign-android-release@v1
         with:
-          releaseDirectory: ssd/src/out/android_${{ matrix.platform }}/apks
+          releaseDirectory: src/out
           signingKeyBase64: ${{ secrets.SIGNING_KEY }}
           alias: ${{ secrets.ALIAS }}
           keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
           keyPassword: ${{ secrets.KEY_PASSWORD }}
+          apkSigningScheme: v2
+          apkPaths: |
+            **/ChromePublic.apk
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: kiwi-${{ matrix.platform }}-${{ github.run_id }}
-          path: ssd/src/out/android_${{ matrix.platform }}/apks/ChromePublic.apk
+      - name: Package artifacts
+        run: |
+          find src/out -name "ChromePublic.apk" -exec sh -c '
+            dir=$(dirname {})
+            arch=$(basename $dir)
+            mv {} src/out/${{ env.APK_PREFIX }}_${arch}_$(date +%Y%m%d).apk
+          ' \;
 
-  release:
-    name: Create Release
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./artifacts
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      # ============== RELEASE PUBLISHING ==============
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v1
         with:
           files: |
-            artifacts/**/*.apk
-          tag_name: v${{ github.run_id }}
-          name: "Kiwi Build $(date +%Y%m%d)"
+            src/out/*.apk
+          tag_name: kiwi-${{ github.run_id }}
+          name: "Kiwi Build $(date +%F)"
           body: |
-            ### Build Details
-            - Chromium Version: $(grep '^LASTCHANGE=' ssd/src/build/util/LASTCHANGE | cut -d'=' -f2)
-            - Build Platform: ${{ matrix.platform }}
-            - Build ID: ${{ github.run_id }}
+            **Build Details**
+            - Chromium Version: $(grep '^LASTCHANGE=' src/build/util/LASTCHANGE | cut -d'=' -f2)
+            - Build Date: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            - Target Architectures: ${{ env.ANDROID_TARGETS }}
           draft: false
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
