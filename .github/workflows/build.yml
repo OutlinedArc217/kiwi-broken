@@ -1,147 +1,139 @@
-name: Kiwi Browser Automated Build
+name: Kiwi Browser Auto Build
 
 on:
   workflow_dispatch:
+    inputs:
+      prepareRelease:
+        description: 'Publish to Google Play Store'
+        required: true
+        default: 'no'
   schedule:
-    - cron: '0 0 * * 1'
-
-env:
-  BUILD_DIR: out/Release
-  APK_PREFIX: KiwiBrowser
-  ANDROID_TARGETS: "arm64 x64"
-  GRADLE_VERSION: 7.4
+    - cron: '0 0 * * 1'  # 每周一 UTC 0 点自动触发
+  push:
+    branches: [main]
 
 jobs:
-  build:
-    name: Build for Android
-    runs-on: ubuntu-22.04
-    timeout-minutes: 360
-
+  sync_chromium:
+    name: Sync Chromium Code
+    runs-on: ubuntu-20.04
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      # ------------------------- 拉取 Kiwi 代码 -------------------------
+      - name: Checkout Kiwi
+        uses: actions/checkout@v2
         with:
-          repository: OutlinedArc217/kiwi-broken
-          token: ${{ secrets.GH_TOKEN }}
-          path: src
-          fetch-depth: 0
-          submodules: recursive
+          fetch-depth: 0  # 需要完整提交历史
 
-      - name: Cache Chromium Dependencies
-        uses: actions/cache@v3
-        id: cache-depot
-        with:
-          path: |
-            ~/depot_tools
-            src/third_party
-          key: ${{ runner.os }}-chromium-deps-${{ hashFiles('src/DEPS') }}
-
-      - name: Cache Build Artifacts
-        uses: actions/cache@v3
-        with:
-          path: |
-            src/out
-            ~/.gradle/caches
-          key: ${{ runner.os }}-build-${{ github.run_id }}
-
-      - name: Setup Build Environment
+      # ------------------------- 配置 Chromium 远程仓库 -------------------------
+      - name: Add Chromium Remote
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            python3 python3-pip ninja-build \
-            libncurses5 libglib2.0-0 libnss3 \
-            openjdk-11-jdk-headless
-          sudo update-java-alternatives --set java-1.11.0-openjdk-amd64
-
-          if [ ! -d "$HOME/depot_tools" ]; then
-            git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git ~/depot_tools
-          fi
-          echo "$HOME/depot_tools" >> $GITHUB_PATH
-
-      - name: Merge Chromium Updates
-        working-directory: ./src
-        run: |
-          git config --global user.name "Kiwi AutoMerger"
-          git config --global user.email "automerger@kiwibrowser.com"
-          
-          if ! git remote | grep -q chromium; then
-            git remote add chromium https://chromium.googlesource.com/chromium/src
-          fi
-
+          git remote add chromium https://chromium.googlesource.com/chromium/src
           git fetch chromium --tags --force
-          LATEST_CHROMIUM_TAG=$(git describe --tags $(git rev-list --tags --max-count=1))
+
+      # ------------------------- 自动合并代码 -------------------------
+      - name: Merge Chromium Updates
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
           
-          if ! git merge $LATEST_CHROMIUM_TAG -X theirs --no-commit; then
-            echo "::error::合并冲突需要手动解决！冲突文件："
-            git diff --name-only --diff-filter=U
-            exit 1
-          fi
+          # 获取最新 Chromium 稳定版标签
+          LATEST_TAG=$(git describe --tags $(git rev-list --tags --max-count=1))
           
-          git commit -m "Merge Chromium $LATEST_CHROMIUM_TAG"
+          # 尝试自动合并（优先保留 Kiwi 修改）
+          git merge $LATEST_TAG -X theirs --no-commit || true
+          
+          # 提交合并结果
+          git commit -m "Merge Chromium $LATEST_TAG" --allow-empty
           git push origin HEAD:auto-merge
 
+  build:
+    name: Build APKs
+    needs: sync_chromium
+    runs-on: ubuntu-20.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [arm, arm64, x86, x64]
+
+    steps:
+      # ------------------------- 获取合并后的代码 -------------------------
+      - name: Checkout Merged Code
+        uses: actions/checkout@v2
+        with:
+          ref: auto-merge  # 使用自动合并分支
+
+      # ------------------------- 签名配置 -------------------------
+      - name: Setup Signing Key
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          echo "$SIGNING_KEY" | base64 -d > keystore.jks
+          ls -la keystore.jks
+
+      # ------------------------- 构建环境 -------------------------
+      - name: Install Build Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python openjdk-8-jdk-headless libncurses5 ccache ninja-build
+
+      # ------------------------- 构建参数 -------------------------
       - name: Configure GN Args
-        working-directory: ./src
         run: |
-          for arch in $ANDROID_TARGETS; do
-            mkdir -p out/$arch
-            cat << EOF > out/$arch/args.gn
-            target_os = "android"
-            target_cpu = "$arch"
-            is_debug = false
-            is_official_build = true
-            symbol_level = 1
-            android_default_version_code = "$(date +%Y%m%d)"
-            android_keystore_name = "release"
-            android_keystore_password = "${{ secrets.KEY_STORE_PASSWORD }}"
-            android_keystore_path = "../../../keystore.jks"
-            EOF
-          done
+          mkdir -p out/android_${{ matrix.platform }}
+          cat <<EOF > out/android_${{ matrix.platform }}/args.gn
+          target_os = "android"
+          target_cpu = "${{ matrix.platform }}"
+          is_debug = false
+          is_official_build = true
+          android_keystore_name = "${{ secrets.ALIAS }}"
+          android_keystore_password = "${{ secrets.KEY_STORE_PASSWORD }}"
+          android_keystore_path = "../../../keystore.jks"
+          EOF
 
-      strategy:
-        matrix:
-          arch: [arm64, x64]
-        fail-fast: false
-
-      - name: Build APK (${{ matrix.arch }})
-        working-directory: ./src
+      # ------------------------- 编译APK -------------------------
+      - name: Build APK
         run: |
-          gn gen out/${{ matrix.arch }} --args="$(cat out/${{ matrix.arch }}/args.gn)"
-          autoninja -C out/${{ matrix.arch }} chrome_public_apk -j $(nproc)
+          gn gen out/android_${{ matrix.platform }}
+          autoninja -C out/android_${{ matrix.platform }} chrome_public_apk
 
-      - name: Sign APKs
+      # ------------------------- 签名APK -------------------------
+      - name: Sign APK
         uses: r0adkll/sign-android-release@v1
         with:
-          releaseDirectory: src/out
+          releaseDirectory: out/android_${{ matrix.platform }}/apks
           signingKeyBase64: ${{ secrets.SIGNING_KEY }}
           alias: ${{ secrets.ALIAS }}
           keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
           keyPassword: ${{ secrets.KEY_PASSWORD }}
-          apkSigningScheme: v2
-          apkPaths: |
-            **/ChromePublic.apk
 
-      - name: Rename APKs
-        run: |
-          find src/out -name "ChromePublic.apk" -exec sh -c '
-            dir=$(dirname {})
-            arch=$(basename $dir)
-            mv {} src/out/${{APK_PREFIX}}_${arch}_$(date +%Y%m%d).apk
-          ' \;
+      # ------------------------- 发布产物 -------------------------
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: kiwi-${{ matrix.platform }}-${{ github.run_id }}
+          path: out/android_${{ matrix.platform }}/apks/ChromePublic.apk
 
-      - name: Create Release
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v2
+        with:
+          path: ./artifacts
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            src/out/*.apk
-          tag_name: kiwi-${{ github.run_id }}
-          name: "Kiwi Browser Build ($(date +%Y-%m-%d))"
-          body: | 
-            **Automated Build Details**
-            - Chromium Version: $(grep '^LASTCHANGE=' src/build/util/LASTCHANGE | cut -d'=' -f2)
-            - Build Date: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-            - Supported Architectures: ${{ env.ANDROID_TARGETS }}
+            artifacts/**/*.apk
+          tag_name: v${{ github.run_id }}
+          name: "Kiwi Build ${{ github.run_id }} (Chromium $(grep '^LASTCHANGE=' build/util/LASTCHANGE | cut -d'=' -f2))"
+          body: |
+            ### Auto-merged Chromium Version
+            - Merged Chromium Tag: $(git describe --tags $(git rev-list --tags --max-count=1))
+            - Build Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
           draft: false
-          prerelease: false
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
