@@ -1,9 +1,9 @@
-name: Kiwi Browser CI/CD Pipeline
+name: Kiwi Browser Automated Pipeline
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * 1' # 每周一 UTC 0 点自动运行
+    - cron: '0 0 * * 1'  # Every Monday 00:00 UTC
 
 env:
   BUILD_DIR: out/Release
@@ -11,24 +11,23 @@ env:
   ANDROID_TARGETS: "arm64 x64"
 
 jobs:
-  sync-and-build:
+  build-and-release:
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
     steps:
-      # ================= 代码同步阶段 =================
-      - name: Configure Sparse Checkout
+      # ============== SPARSE CHECKOUT ==============
+      - name: Configure sparse checkout
         run: |
           git config --global core.sparseCheckout true
           git config --global core.sparseCheckoutCone false
-
           mkdir -p .git/info
           echo "/*" > .git/info/sparse-checkout
           echo "!third_party/*" >> .git/info/sparse-checkout
           echo "!tools/*" >> .git/info/sparse-checkout
           echo "!docs/*" >> .git/info/sparse-checkout
 
-      - name: Checkout Code
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           repository: OutlinedArc217/kiwi-broken
@@ -41,8 +40,8 @@ jobs:
             !tools/*
             !docs/*
 
-      # ================= 环境配置阶段 =================
-      - name: Setup Build Environment
+      # ============== ENVIRONMENT SETUP ==============
+      - name: Set up build environment
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -54,8 +53,8 @@ jobs:
           git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
           echo "$GITHUB_WORKSPACE/depot_tools" >> $GITHUB_PATH
 
-      # ================= 代码合并阶段 =================
-      - name: Merge Chromium Updates
+      # ============== CODE MERGING ==============
+      - name: Merge Chromium updates
         working-directory: ./src
         run: |
           git config user.name "Kiwi AutoMerger"
@@ -66,13 +65,13 @@ jobs:
           fi
 
           git fetch chromium --tags --depth=1
-          LATEST_CHROMIUM_TAG=$(git describe --tags $(git rev-list --tags --max-count=1))
+          LATEST_TAG=$(git describe --tags $(git rev-list --tags --max-count=1))
           
-          git merge $LATEST_CHROMIUM_TAG -X ours --no-commit || true
-          git commit -m "Merge Chromium $LATEST_CHROMIUM_TAG" || echo "No changes to commit"
+          git merge $LATEST_TAG -X ours --no-commit || true
+          git commit -m "Merge Chromium $LATEST_TAG" || echo "No changes to commit"
 
-      # ================= 构建配置阶段 =================
-      - name: Configure GN Args
+      # ============== BUILD CONFIGURATION ==============
+      - name: Generate build configs
         working-directory: ./src
         run: |
           for arch in $ANDROID_TARGETS; do
@@ -90,7 +89,7 @@ jobs:
             EOF
           done
 
-      # ================= 并行构建阶段 =================
+      # ============== PARALLEL BUILD ==============
       strategy:
         matrix:
           arch: [arm64, x64]
@@ -102,7 +101,7 @@ jobs:
           gn gen out/${{ matrix.arch }} --args="$(cat out/${{ matrix.arch }}/args.gn)"
           autoninja -C out/${{ matrix.arch }} chrome_public_apk -j $(nproc)
 
-      # ================= 签名发布阶段 =================
+      # ============== ARTIFACT PROCESSING ==============
       - name: Sign APKs
         uses: r0adkll/sign-android-release@v1
         with:
@@ -115,17 +114,27 @@ jobs:
           apkPaths: |
             **/ChromePublic.apk
 
-      - name: Rename and Release
+      - name: Package artifacts
         run: |
           find src/out -name "ChromePublic.apk" -exec sh -c '
             dir=$(dirname {})
             arch=$(basename $dir)
-            mv {} src/out/${{APK_PREFIX}}_${arch}_$(date +%Y%m%d).apk
+            mv {} src/out/${{ env.APK_PREFIX }}_${arch}_$(date +%Y%m%d).apk
           ' \;
 
-          gh release create kiwi-$(date +%Y%m%d) \
-            --title "Kiwi Build $(date +%F)" \
-            --notes-file <(echo "Chromium Version: $(grep '^LASTCHANGE=' src/build/util/LASTCHANGE | cut -d'=' -f2)") \
+      # ============== RELEASE PUBLISHING ==============
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
             src/out/*.apk
+          tag_name: kiwi-${{ github.run_id }}
+          name: "Kiwi Build $(date +%F)"
+          body: |
+            **Build Details**
+            - Chromium Version: $(grep '^LASTCHANGE=' src/build/util/LASTCHANGE | cut -d'=' -f2)
+            - Build Date: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            - Target Architectures: ${{ env.ANDROID_TARGETS }}
+          draft: false
         env:
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
