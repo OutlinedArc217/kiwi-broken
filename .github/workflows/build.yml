@@ -1,9 +1,9 @@
-name: Kiwi Browser Automated Pipeline
+name: Kiwi Browser CI/CD
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * 1'  # Every Monday 00:00 UTC
+    - cron: '0 0 * * 1'  # 每周一 UTC 0 点自动触发
 
 env:
   BUILD_DIR: out/Release
@@ -11,12 +11,12 @@ env:
   ANDROID_TARGETS: "arm64 x64"
 
 jobs:
-  build-and-release:
+  build-pipeline:
     runs-on: ubuntu-22.04
-    timeout-minutes: 360
+    timeout-minutes: 400
 
     steps:
-      # ============== SPARSE CHECKOUT ==============
+      # ============== 稀疏检出阶段 ==============
       - name: Configure sparse checkout
         run: |
           git config --global core.sparseCheckout true
@@ -27,7 +27,7 @@ jobs:
           echo "!tools/*" >> .git/info/sparse-checkout
           echo "!docs/*" >> .git/info/sparse-checkout
 
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
           repository: OutlinedArc217/kiwi-broken
@@ -40,8 +40,8 @@ jobs:
             !tools/*
             !docs/*
 
-      # ============== ENVIRONMENT SETUP ==============
-      - name: Set up build environment
+      # ============== 环境配置阶段 ==============
+      - name: Setup build environment
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -53,12 +53,12 @@ jobs:
           git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
           echo "$GITHUB_WORKSPACE/depot_tools" >> $GITHUB_PATH
 
-      # ============== CODE MERGING ==============
+      # ============== 代码合并阶段 ==============
       - name: Merge Chromium updates
         working-directory: ./src
         run: |
-          git config user.name "Kiwi AutoMerger"
-          git config user.email "automerger@kiwibrowser.com"
+          git config user.name "AutoMerger"
+          git config user.email "automerger@kiwi"
           
           if ! git remote | grep -q chromium; then
             git remote add chromium https://chromium.googlesource.com/chromium/src
@@ -68,40 +68,38 @@ jobs:
           LATEST_TAG=$(git describe --tags $(git rev-list --tags --max-count=1))
           
           git merge $LATEST_TAG -X ours --no-commit || true
-          git commit -m "Merge Chromium $LATEST_TAG" || echo "No changes to commit"
+          git commit -m "Merge Chromium $LATEST_TAG" || echo "No changes"
 
-      # ============== BUILD CONFIGURATION ==============
-      - name: Generate build configs
-        working-directory: ./src
-        run: |
-          for arch in $ANDROID_TARGETS; do
-            mkdir -p out/$arch
-            cat << EOF > out/$arch/args.gn
-            target_os = "android"
-            target_cpu = "$arch"
-            is_debug = false
-            is_official_build = true
-            symbol_level = 1
-            android_default_version_code = "$(date +%Y%m%d)"
-            android_keystore_name = "release"
-            android_keystore_password = "${{ secrets.KEY_STORE_PASSWORD }}"
-            android_keystore_path = "../../../keystore.jks"
-            EOF
-          done
-
-      # ============== PARALLEL BUILD ==============
+      # ============== 构建配置阶段 ==============
       strategy:
         matrix:
           arch: [arm64, x64]
         fail-fast: false
 
+      - name: Configure build for ${{ matrix.arch }}
+        working-directory: ./src
+        run: |
+          mkdir -p out/${{ matrix.arch }}
+          cat << EOF > out/${{ matrix.arch }}/args.gn
+          target_os = "android"
+          target_cpu = "${{ matrix.arch }}"
+          is_debug = false
+          is_official_build = true
+          symbol_level = 1
+          android_default_version_code = "$(date +%Y%m%d)"
+          android_keystore_name = "release"
+          android_keystore_password = "${{ secrets.KEY_STORE_PASSWORD }}"
+          android_keystore_path = "../../../keystore.jks"
+          EOF
+
+      # ============== 编译阶段 ==============
       - name: Build APK (${{ matrix.arch }})
         working-directory: ./src
         run: |
           gn gen out/${{ matrix.arch }} --args="$(cat out/${{ matrix.arch }}/args.gn)"
           autoninja -C out/${{ matrix.arch }} chrome_public_apk -j $(nproc)
 
-      # ============== ARTIFACT PROCESSING ==============
+      # ============== 产物处理阶段 ==============
       - name: Sign APKs
         uses: r0adkll/sign-android-release@v1
         with:
@@ -114,7 +112,7 @@ jobs:
           apkPaths: |
             **/ChromePublic.apk
 
-      - name: Package artifacts
+      - name: Rename artifacts
         run: |
           find src/out -name "ChromePublic.apk" -exec sh -c '
             dir=$(dirname {})
@@ -122,8 +120,8 @@ jobs:
             mv {} src/out/${{ env.APK_PREFIX }}_${arch}_$(date +%Y%m%d).apk
           ' \;
 
-      # ============== RELEASE PUBLISHING ==============
-      - name: Create GitHub release
+      # ============== 发布阶段 ==============
+      - name: Publish release
         uses: softprops/action-gh-release@v1
         with:
           files: |
@@ -131,10 +129,10 @@ jobs:
           tag_name: kiwi-${{ github.run_id }}
           name: "Kiwi Build $(date +%F)"
           body: |
-            **Build Details**
-            - Chromium Version: $(grep '^LASTCHANGE=' src/build/util/LASTCHANGE | cut -d'=' -f2)
-            - Build Date: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-            - Target Architectures: ${{ env.ANDROID_TARGETS }}
+            **构建信息**
+            - Chromium 版本: $(grep '^LASTCHANGE=' src/build/util/LASTCHANGE | cut -d'=' -f2)
+            - 构建时间: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            - 目标架构: ${{ env.ANDROID_TARGETS }}
           draft: false
         env:
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
