@@ -70,10 +70,10 @@ jobs:
           git commit -m "Merge Chromium $LATEST_TAG" || echo "No changes"
 
       # ============== 构建配置阶段 ==============
-      strategy:
-        matrix:
-          arch: [arm64, x64]
-        fail-fast: false
+      - strategy:
+          matrix:
+            arch: [arm64, x64]
+          fail-fast: false
 
       - name: Configure build for ${{ matrix.arch }}
         working-directory: ./src
