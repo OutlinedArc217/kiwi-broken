@@ -16,7 +16,6 @@ jobs:
     timeout-minutes: 400
 
     steps:
-      # ============== 稀疏检出阶段 ==============
       - name: Configure sparse checkout
         run: |
           git config --global core.sparseCheckout true
